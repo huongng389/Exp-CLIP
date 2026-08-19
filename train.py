@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import time
 import torch
 import torch.nn as nn
@@ -39,6 +40,9 @@ parser.add_argument('--seed', type=int)
 parser.add_argument('--job-id', type=str)
 parser.add_argument('--instruction', type=str)
 parser.add_argument('--load-model', type=str)
+parser.add_argument('--extra-checkpoint-dir', type=str, default=None,
+                     help='If set, also copy each epoch checkpoint here (e.g. a mounted Google Drive path), '
+                          'so progress survives a Colab runtime loss.')
 args = parser.parse_args()
 
 random.seed(args.seed)  
@@ -126,9 +130,21 @@ def main():
             f.write('The best accuracy: ' + str(train_acc.item()) + '\n')
             f.write('An epoch time: ' + str(epoch_time) + 's' + '\n')
 
+        # save a checkpoint after every epoch so progress survives an interrupted run
+        epoch_checkpoint_name = checkpoint_path + '-model.pth'
+        torch.save(model.module.projection_head.state_dict(), epoch_checkpoint_name)
+        if args.extra_checkpoint_dir:
+            os.makedirs(args.extra_checkpoint_dir, exist_ok=True)
+            shutil.copy2(epoch_checkpoint_name, args.extra_checkpoint_dir)
+            shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
+
     #  save model and conduct zero-shot prediction
     checkpoint_name = checkpoint_path + '-model.pth'
     torch.save(model.module.projection_head.state_dict(), checkpoint_name)
+    if args.extra_checkpoint_dir:
+        os.makedirs(args.extra_checkpoint_dir, exist_ok=True)
+        shutil.copy2(checkpoint_name, args.extra_checkpoint_dir)
+        shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
