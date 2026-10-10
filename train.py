@@ -43,6 +43,11 @@ parser.add_argument('--load-model', type=str)
 parser.add_argument('--extra-checkpoint-dir', type=str, default=None,
                      help='If set, also copy each epoch checkpoint here (e.g. a mounted Google Drive path), '
                           'so progress survives a Colab runtime loss.')
+parser.add_argument('--train-data', type=str,
+                     default='/data/EECS-IoannisLab/datasets/Static_FER_Datasets/CAERS_Face/train',
+                     help='ImageFolder-style directory of training face images (e.g. CAER-S train).')
+parser.add_argument('--resume', type=str, default=None,
+                     help='Path to a <job-id>-resume.pth file to continue training from the epoch after it.')
 args = parser.parse_args()
 
 random.seed(args.seed)  
@@ -67,7 +72,8 @@ def main():
     log_txt_path = './log/' + job_id + '-log.txt'
     log_curve_path = './log/' + job_id + '-log.png'
     checkpoint_path = './checkpoint/' + job_id
-    train_data_file_path = '/data/EECS-IoannisLab/datasets/Static_FER_Datasets/CAERS_Face/train'
+    resume_path = checkpoint_path + '-resume.pth'
+    train_data_file_path = args.train_data
     recorder = RecorderMeter(args.epochs)
 
     # create model and load pre_trained parameters
@@ -106,7 +112,27 @@ def main():
                                                pin_memory=True, 
                                                drop_last=True)
 
-    for epoch in range(0, args.epochs):
+    # resume projection head, optimizer, scheduler, curve and RNG states from a previous run
+    start_epoch = 0
+    if args.resume:
+        state = torch.load(args.resume, map_location='cpu')
+        model.module.projection_head.load_state_dict(state['projection_head'])
+        optimizer.load_state_dict(state['optimizer'])
+        scheduler.load_state_dict(state['scheduler'])
+        start_epoch = state['epoch'] + 1
+        n = min(start_epoch, args.epochs)
+        recorder.epoch_losses[:n] = state['epoch_losses'][:n]
+        recorder.epoch_accuracy[:n] = state['epoch_accuracy'][:n]
+        recorder.current_epoch = n
+        random.setstate(state['random_state'])
+        np.random.set_state(state['numpy_state'])
+        torch.set_rng_state(state['torch_state'])
+        torch.cuda.set_rng_state_all(state['cuda_state'])
+        print('Resumed from {} (finished epoch {}), continuing at epoch {}'.format(args.resume, state['epoch'], start_epoch))
+        with open(log_txt_path, 'a') as f:
+            f.write('Resumed from ' + args.resume + ' at epoch ' + str(start_epoch) + '\n')
+
+    for epoch in range(start_epoch, args.epochs):
 
         inf = '********************' + str(epoch) + '********************'
         start_time = time.time()
@@ -133,9 +159,20 @@ def main():
         # save a checkpoint after every epoch so progress survives an interrupted run
         epoch_checkpoint_name = checkpoint_path + '-model.pth'
         torch.save(model.module.projection_head.state_dict(), epoch_checkpoint_name)
+        torch.save({'epoch': epoch,
+                    'projection_head': model.module.projection_head.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch_losses': recorder.epoch_losses,
+                    'epoch_accuracy': recorder.epoch_accuracy,
+                    'random_state': random.getstate(),
+                    'numpy_state': np.random.get_state(),
+                    'torch_state': torch.get_rng_state(),
+                    'cuda_state': torch.cuda.get_rng_state_all()}, resume_path)
         if args.extra_checkpoint_dir:
             os.makedirs(args.extra_checkpoint_dir, exist_ok=True)
             shutil.copy2(epoch_checkpoint_name, args.extra_checkpoint_dir)
+            shutil.copy2(resume_path, args.extra_checkpoint_dir)
             shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
 
     #  save model and conduct zero-shot prediction
