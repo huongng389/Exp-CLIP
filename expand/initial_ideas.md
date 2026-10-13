@@ -8,12 +8,13 @@
 - Hệ quả: nếu LLM "hiểu sai" khuôn mặt, embedding target bị nhiễu, và projection head học theo cái nhiễu đó. Không thể kiểm tra trực tiếp một vector 4096-d có đúng hay không.
 
 ### Ý tưởng cốt lõi
-Cho decoder chạy thật (dùng `generate` gốc của LAVIS) để lấy **câu mô tả**, làm *bản đọc ra* (readout) những gì LLM "nghĩ" về ảnh, vì câu này được sinh từ chính embedding encoder đó. Kiểm tra câu này để ước lượng độ tin cậy của embedding target cho từng mẫu, rồi **gán trọng số cho mẫu trong InfoNCE** (hoặc bỏ mẫu). Câu chữ chỉ dùng để chấm điểm, không thay thế target.
+Ước lượng độ tin cậy của **vector target** cho từng ảnh, rồi **gán trọng số cho ảnh trong InfoNCE** (hoặc loại ảnh). Kiểm tra thẳng trên vector, đúng không gian mà loss dùng, không cần cho decoder sinh câu.
 
 ### Ý tưởng 1: Kiểm chứng bằng AU detector (khuyên dùng)
-- Chạy AU detector (VD OpenFace, LibreFace, ME-GraphAU) trên ảnh để lấy tập AU thực tế.
-- Map câu mô tả LLM sang AU (bảng từ khóa → AU, VD "raised eyebrows" → AU1+AU2, "smiling" → AU12).
-- Điểm tin cậy `w_AU` = mức khớp giữa AU trong câu và AU detector (VD F1/Jaccard). Mẫu bị LLM "bịa" cơ mặt thì có `w_AU` thấp và bị hạ trọng số trong loss.
+- Chạy AU detector (VD py-feat, LibreFace, ME-GraphAU) trên ảnh để lấy tập AU thực tế.
+- **Đọc AU thẳng từ vector target, không qua chữ:** encode các câu mẫu mô tả từng AU (VD "the eyebrows are lowered and drawn together" → AU4) bằng cùng T5 encoder. Cosine giữa target và các vector mẫu cho ra "hồ sơ AU theo LLM" của ảnh.
+- Điểm tin cậy `w_AU` = mức khớp giữa hồ sơ AU theo LLM và AU detector. Ảnh nào vector target "nói" AU khác hẳn detector thì bị hạ trọng số trong loss.
+- (Hướng cũ là decode câu rồi map sang AU bằng từ khóa; đã bỏ vì gián tiếp và câu quá ngắn, xem EXP-001.)
 
 ### Ý tưởng 2: Độ đồng thuận của LLM (self-consistency)
 - Với mỗi ảnh, chạy LLM K lần (đổi instruction paraphrase, hoặc augment ảnh nhẹ).
@@ -27,5 +28,5 @@ Cho decoder chạy thật (dùng `generate` gốc của LAVIS) để lấy **câ
 - Loss: `L = Σ_i w_i · ℓ_i / Σ_i w_i`, trong đó `ℓ_i` là InfoNCE đối xứng của mẫu i.
 
 ### Ghi chú triển khai
-- Dữ liệu train (CAER-S) cố định, nên có thể **tính trước offline** câu mô tả, AU và `w` cho từng ảnh rồi lưu ra file. Khi train chỉ cần đọc `w`, không tốn thêm chi phí.
-- Sinh câu bằng model BLIP-2 chưa bị patch (cùng instruction, cùng tiền xử lý ảnh như `train.py`); sửa `train.py` để dùng loss có trọng số.
+- Dữ liệu train (CAER-S) cố định, nên có thể **tính trước offline** vector target, AU và `w` cho từng ảnh rồi lưu ra file. Khi train chỉ cần đọc `w`, không tốn thêm chi phí.
+- Sửa `train.py` để dùng loss có trọng số.

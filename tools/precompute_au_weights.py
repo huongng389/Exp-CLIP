@@ -1,71 +1,122 @@
-"""EXP-001: per-image confidence weights from LLM captions vs. a real AU detector.
+"""EXP-001: per-image confidence weights from the LLM target vector vs. a real AU detector.
 
-The training target of Exp-CLIP is the T5 encoder state of BLIP-2 (FlanT5-XXL) for
-(image, instruction). The patched `generate` in models/BLIP2_T5.py never runs the decoder,
-so here we load an *unpatched* BLIP-2 and decode the caption that this same encoder state
-produces. The caption's facial actions are then checked against an AU detector (py-feat);
-images whose caption claims actions the detector does not see get a low weight.
+The training target of Exp-CLIP is the BLIP-2 (FlanT5-XXL) T5 *encoder* state for
+(32 Q-Former image tokens + instruction), mean-pooled and L2-normalised; no text is ever
+decoded. So we read the facial actions straight from that vector: reference sentences for
+each AU group ("the eyebrows are lowered and drawn together", ...) are encoded with the same
+T5 encoder, and the cosine between target and these prototypes gives the image's
+"LLM AU profile". It is compared with an AU detector (py-feat); images whose profile
+disagrees with the detector get a low weight.
 
-Three resumable stages (run in order; each writes to --out-dir):
+Resumable stages, run in order (each writes to --out-dir):
 
-    # 1) captions.jsonl  (needs lavis + GPU, same model/instruction as training)
-    python tools/precompute_au_weights.py caption --train-data /content/CAER-S_Face/train \
-        --out-dir /content/drive/MyDrive/exp001 --instruction "Please play the role of ..."
-    # 2) aus.csv  (pip install py-feat)
-    python tools/precompute_au_weights.py au --train-data /content/CAER-S_Face/train \
-        --out-dir /content/drive/MyDrive/exp001
-    # 3) au_weights.json + au_weights_debug.csv
-    python tools/precompute_au_weights.py weight --out-dir /content/drive/MyDrive/exp001
+    # 1) targets/*.npz : target vectors, exactly as in training (lavis + GPU)
+    python tools/precompute_au_weights.py target --train-data /content/CAER-S_Face/train --out-dir OUT
+    # 2) protos.npz : AU prototype vectors (lavis + GPU)
+    python tools/precompute_au_weights.py proto --out-dir OUT
+    # 3) aus.csv : py-feat AU probabilities (separate venv with py-feat)
+    python tools/precompute_au_weights.py au --train-data /content/CAER-S_Face/train --out-dir OUT
+    # 4) au_weights_<tag>.json + sanity tables (numpy only)
+    python tools/precompute_au_weights.py weight --out-dir OUT --pool all --proto plain
 
-Use --limit N on stages 1-2 to try a few images first.
+Use --limit N on stages 1 and 3 to try a random subset (same subset in both stages).
 Keys in all outputs are image paths relative to --train-data (as in ImageFolder).
 """
 import argparse
 import csv
+import glob
 import json
 import os
-import re
+import random
+import sys
 
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp')
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_INSTRUCTION = ('Please play the role of a facial action describer. '
+                       'Objectively describe the detailed facial actions of the person in the image.')
 
-# Concept groups: a caption mentions a group via keywords; the detector "sees" the group if
-# any of its AUs is active. Matching on groups (not single AUs) because captions are coarse
-# ("raised eyebrows" = AU1 and/or AU2).
+# AU group -> (AUs that the detector reports for it, reference sentences)
 AU_GROUPS = {
-    'brow_raise':     (['AU01', 'AU02'], [
-        r'\b(rais|lift|arch)\w*\s+(\w+\s+){0,2}(eye)?brows?\b',
-        r'\b(eye)?brows?\s+(are\s+|is\s+)?(slightly\s+)?(rais|lift|arch)\w*']),
-    'brow_lower':     (['AU04'], [
-        r'\bfrown\w*', r'\bfurrow\w*', r'\bscowl\w*', r'\bknit\w*\s+(\w+\s+)?brows?',
-        r'\bbrows?\s+(are\s+)?(drawn|pulled|knitted)\s+together', r'\blower\w*\s+(\w+\s+)?(eye)?brows?']),
+    'brow_raise': (['AU01', 'AU02'], [
+        'The eyebrows are raised.',
+        'The person raises their eyebrows.',
+        'The inner and outer brows are lifted upward.',
+        'The eyebrows are lifted high, wrinkling the forehead.',
+        'The brows are arched upward.']),
+    'brow_lower': (['AU04'], [
+        'The eyebrows are lowered and drawn together.',
+        'The person is frowning.',
+        'The brows are furrowed.',
+        'The eyebrows are knitted together, creating vertical lines between them.',
+        'The person scowls with lowered brows.']),
     'upper_lid_raise': (['AU05'], [
-        r'\bwide[\s-]*(open\s+)?eyes', r'\beyes\s+(are\s+)?(wide|widened)', r'\bwiden\w*\s+(\w+\s+)?eyes',
-        r'\bstar(e|ing)\b']),
-    'cheek_raise':    (['AU06'], [
-        r'\bcheeks?\s+(are\s+|is\s+)?rais\w*', r'\brais\w*\s+(\w+\s+)?cheeks?', r"\bcrow'?s[\s-]feet"]),
-    'lid_tight':      (['AU07'], [
-        r'\bsquint\w*', r'\bnarrow\w*\s+(\w+\s+)?eyes', r'\beyes\s+(are\s+)?narrow\w*']),
-    'nose_wrinkle':   (['AU09', 'AU10'], [
-        r'\bwrinkl\w*\s+(\w+\s+)?nose', r'\bnose\s+(is\s+)?wrinkl\w*', r'\bsneer\w*',
-        r'\bupper\s+lip\s+(is\s+)?rais\w*', r'\brais\w*\s+(\w+\s+)?upper\s+lip']),
+        'The eyes are wide open.',
+        'The upper eyelids are raised.',
+        'The person stares with widened eyes.',
+        'The eyes are opened wide, showing the whites above the iris.',
+        'The person widens their eyes.']),
+    'cheek_raise': (['AU06'], [
+        'The cheeks are raised.',
+        'The cheeks are pushed up, narrowing the eyes from below.',
+        "Crow's feet wrinkles appear at the corners of the eyes.",
+        'The person raises their cheeks.',
+        'The skin below the eyes is pushed upward by the cheeks.']),
+    'lid_tight': (['AU07'], [
+        'The eyelids are tightened.',
+        'The person squints.',
+        'The eyes are narrowed.',
+        'The lower eyelids are raised and tense.',
+        'The person narrows their eyes.']),
+    'nose_wrinkle': (['AU09', 'AU10'], [
+        'The nose is wrinkled.',
+        'The upper lip is raised.',
+        'The person wrinkles their nose.',
+        'The person sneers, raising the upper lip.',
+        'The nose is scrunched up and the upper lip is lifted.']),
     'lip_corner_pull': (['AU12'], [
-        r'\bsmil\w*', r'\bgrin\w*', r'\blaugh\w*',
-        r'\b(lip\s+)?corners?\s+(of\s+(the|his|her|their)\s+(mouth|lips)\s+)?(are\s+|is\s+)?(pulled|turned|raised|curved)\s+up']),
-    'dimpler':        (['AU14'], [r'\bdimpl\w*', r'\bsmirk\w*']),
+        'The person is smiling.',
+        'The corners of the lips are pulled up.',
+        'The person grins.',
+        'The mouth corners are raised in a smile.',
+        'The lips are stretched upward into a smile.']),
+    'dimpler': (['AU14'], [
+        'Dimples appear at the corners of the mouth.',
+        'The person smirks.',
+        'The lip corners are tightened and pulled inward.',
+        'The person has a one-sided smirk.',
+        'The corners of the mouth are dimpled.']),
     'lip_corner_depress': (['AU15', 'AU17'], [
-        r'\b(lip\s+)?corners?\s+(of\s+(the|his|her|their)\s+(mouth|lips)\s+)?(are\s+|is\s+)?(pulled|turned|drawn)\s+down',
-        r'\bdownturned', r'\bpout\w*', r'\bchin\s+(is\s+)?(rais|push|wrinkl)\w*']),
-    'lip_stretch':    (['AU20'], [r'\blips?\s+(are\s+|is\s+)?stretch\w*', r'\bgrimac\w*']),
-    'lip_press':      (['AU23', 'AU24', 'AU28'], [
-        r'\b(lips?|mouth)\s+(are\s+|is\s+)?(tightly\s+)?(pressed|tightened|pursed|compressed|clenched)',
-        r'\b(pursed|pressed|tight\w*|compressed)\s+lips', r'\bpurs\w*\s+(\w+\s+)?lips']),
-    'mouth_open':     (['AU25', 'AU26'], [
-        r'\bmouth\s+(is\s+)?(slightly\s+|wide\s+|partially\s+)?open', r'\bopen\w*\s+(\w+\s+)?mouth',
-        r'\bparted\s+lips', r'\blips\s+(are\s+)?(slightly\s+)?parted', r'\bjaw\s+(is\s+)?drop\w*',
-        r'\bgap\w*', r'\byawn\w*']),
-    'eyes_closed':    (['AU43'], [r'\beyes\s+(are\s+)?(closed|shut)', r'\bclos\w*\s+(\w+\s+)?eyes', r'\bblink\w*']),
+        'The corners of the mouth are pulled down.',
+        'The person pouts.',
+        'The chin is raised and the lower lip is pushed up.',
+        'The mouth is turned down at the corners.',
+        'The lip corners are depressed.']),
+    'lip_stretch': (['AU20'], [
+        'The lips are stretched horizontally.',
+        'The person grimaces.',
+        'The mouth is pulled wide sideways.',
+        'The lips are stretched tight toward the ears.',
+        'The person stretches their lips.']),
+    'lip_press': (['AU23', 'AU24', 'AU28'], [
+        'The lips are pressed together.',
+        'The lips are tightened.',
+        'The person purses their lips.',
+        'The lips are pressed tightly into a thin line.',
+        'The mouth is closed with tense lips.']),
+    'mouth_open': (['AU25', 'AU26'], [
+        'The mouth is open.',
+        'The lips are parted.',
+        'The jaw drops.',
+        'The mouth hangs open.',
+        'The person opens their mouth.']),
+    'eyes_closed': (['AU43'], [
+        'The eyes are closed.',
+        'The person shuts their eyes.',
+        'The eyelids are closed.',
+        'The person blinks.',
+        'The eyes are shut tightly.']),
 }
-NEGATION = re.compile(r"\b(not|no|without|never|n't)\b(\s+\w+){0,2}\s*$")
+GROUPS = list(AU_GROUPS)
 
 
 def list_images(root):
@@ -78,46 +129,94 @@ def list_images(root):
 
 
 def todo(root, done, limit):
-    paths = [p for p in list_images(root) if p not in done]
-    return paths[:limit] if limit else paths
+    # fixed shuffle so --limit gives a sample spread over classes/clips (not the first N files
+    # of Angry/), and the target and au stages pick the same images
+    paths = list_images(root)
+    random.Random(0).shuffle(paths)
+    if limit:
+        paths = paths[:limit]
+    return [p for p in paths if p not in done]
 
 
-# ---------------------------------------------------------------- stage 1: captions
-def stage_caption(args):
+def load_blip2(device):
+    sys.path.insert(0, REPO_ROOT)
+    from models.BLIP2_T5 import get_blip2t5_model, get_tokens
+    return get_blip2t5_model(device), get_tokens
+
+
+# ---------------------------------------------------------------- stage 1: targets
+def stage_target(args):
+    import numpy as np
     import torch
-    from PIL import Image
+    import torch.nn.functional as F
     import torchvision.transforms as transforms
-    from lavis.models import load_model_and_preprocess
+    from PIL import Image
 
-    out_path = os.path.join(args.out_dir, 'captions.jsonl')
-    done = set()
-    if os.path.exists(out_path):
-        with open(out_path) as f:
-            done = {json.loads(line)['path'] for line in f}
+    tdir = os.path.join(args.out_dir, 'targets')
+    os.makedirs(tdir, exist_ok=True)
+    chunks = sorted(glob.glob(os.path.join(tdir, 'chunk_*.npz')))
+    done = {p for c in chunks for p in np.load(c)['paths']}
     paths = todo(args.train_data, done, args.limit)
-    print(f'{len(done)} done, {len(paths)} to caption')
+    print(f'{len(done)} done, {len(paths)} to encode')
+    if not paths:
+        return
 
-    device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
-    # unpatched model: its generate() runs the decoder (models/BLIP2_T5.get_blip2t5_model does not)
-    model, _, _ = load_model_and_preprocess(name='blip2_t5', model_type='pretrain_flant5xxl',
-                                            is_eval=True, device=device)
-    # same preprocessing as train.py, so the caption is decoded from the same encoder state
+    # same preprocessing as train.py, so the vectors are exactly the training targets
     tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
 
-    with open(out_path, 'a') as f:
-        for i in range(0, len(paths), args.batch_size):
-            batch = paths[i:i + args.batch_size]
-            images = torch.stack([tf(Image.open(os.path.join(args.train_data, p)).convert('RGB'))
-                                  for p in batch]).to(device)
-            captions = model.generate({'image': images, 'prompt': args.instruction},
-                                      num_beams=args.num_beams, max_length=args.max_length)
-            for p, c in zip(batch, captions):
-                f.write(json.dumps({'path': p, 'caption': c}) + '\n')
-            f.flush()
-            print(f'{i + len(batch)}/{len(paths)}  e.g. {batch[0]}: {captions[0]}')
+    class Images(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, i):
+            return tf(Image.open(os.path.join(args.train_data, paths[i])).convert('RGB')), paths[i]
+
+    loader = torch.utils.data.DataLoader(Images(), batch_size=args.batch_size, num_workers=args.workers)
+    device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
+    model, get_tokens = load_blip2(device)
+    n_query = model.query_tokens.shape[1]
+
+    n = 0
+    for k, (images, batch_paths) in enumerate(loader, start=len(chunks)):
+        tokens = get_tokens(args.instruction, model.t5_tokenizer, len(batch_paths), device)
+        _, h = model.generate({'image': images.to(device), 'tokens': tokens})
+        h = h.float()  # (B, n_query + instruction length, 4096)
+        np.savez(os.path.join(tdir, f'chunk_{k:05d}.npz'), paths=np.array(batch_paths),
+                 all=F.normalize(h.mean(1), dim=-1).half().cpu().numpy(),             # = training target
+                 img=F.normalize(h[:, :n_query].mean(1), dim=-1).half().cpu().numpy())  # image tokens only
+        n += len(batch_paths)
+        print(f'{n}/{len(paths)}')
 
 
-# ---------------------------------------------------------------- stage 2: AUs
+# ---------------------------------------------------------------- stage 2: prototypes
+def stage_proto(args):
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
+    model, _ = load_blip2(device)
+
+    def encode(texts):
+        tok = model.t5_tokenizer(texts, padding='longest', return_tensors='pt').to(device)
+        with torch.no_grad(), model.maybe_autocast(dtype=torch.bfloat16):
+            h = model.t5_model.encoder(input_ids=tok.input_ids, attention_mask=tok.attention_mask,
+                                       return_dict=True).last_hidden_state
+        m = tok.attention_mask.unsqueeze(-1).float()
+        return F.normalize((h.float() * m).sum(1) / m.sum(1), dim=-1)
+
+    out = {'groups': np.array(GROUPS)}
+    # plain: the sentence alone; templ: sentence after the training instruction
+    for name, fmt in [('plain', '{}'), ('templ', args.instruction + ' {}')]:
+        vecs = [F.normalize(encode([fmt.format(s) for s in AU_GROUPS[g][1]]).mean(0), dim=-1) for g in GROUPS]
+        out[name] = torch.stack(vecs).cpu().numpy()
+        sim = out[name] @ out[name].T
+        print(f'{name}: mean cosine between different groups {sim[~np.eye(len(GROUPS), dtype=bool)].mean():.3f}')
+    np.savez(os.path.join(args.out_dir, 'protos.npz'), **out)
+    print(f'saved {len(GROUPS)} prototypes')
+
+
+# ---------------------------------------------------------------- stage 3: AUs
 def stage_au(args):
     from feat import Detector
 
@@ -157,94 +256,115 @@ def stage_au(args):
             print(f'{i + len(batch)}/{len(paths)}')
 
 
-# ---------------------------------------------------------------- stage 3: weights
-def text_groups(caption):
-    text = caption.lower()
-    found = set()
-    for group, (_, patterns) in AU_GROUPS.items():
-        for pat in patterns:
-            for m in re.finditer(pat, text):
-                if not NEGATION.search(text[:m.start()]):
-                    found.add(group)
-                    break
-            if group in found:
-                break
-    return found
-
-
-def detected_groups(aus, threshold):
-    return {g for g, (au_list, _) in AU_GROUPS.items()
-            if any(aus.get(a, 0.0) >= threshold for a in au_list)}
-
-
+# ---------------------------------------------------------------- stage 4: weights
 def stage_weight(args):
-    with open(os.path.join(args.out_dir, 'captions.jsonl')) as f:
-        captions = {d['path']: d['caption'] for d in map(json.loads, f)}
-    aus = {}
+    import numpy as np
+
+    def zscore(m):
+        return (m - m.mean(0)) / (m.std(0) + 1e-8)
+
+    def ranks(v):
+        r = np.empty(len(v))
+        r[np.argsort(v)] = np.arange(len(v))
+        return r
+
+    chunks = sorted(glob.glob(os.path.join(args.out_dir, 'targets', 'chunk_*.npz')))
+    paths = [p for c in chunks for p in np.load(c)['paths']]
+    X = np.concatenate([np.load(c)[args.pool] for c in chunks]).astype(np.float32)
+    protos = np.load(os.path.join(args.out_dir, 'protos.npz'))
+    assert list(protos['groups']) == GROUPS, 'protos.npz is from another AU group list, rerun stage proto'
+    P = protos[args.proto].astype(np.float32)
+
+    aus, no_face = {}, set()
     with open(os.path.join(args.out_dir, 'aus.csv')) as f:
         for row in csv.DictReader(f):
             if row['face_found'] == '1':
                 aus[row['path']] = {k: float(v) for k, v in row.items() if k.startswith('AU')}
-
-    weights, n_missing, scores = {}, 0, []
-    with open(os.path.join(args.out_dir, 'au_weights_debug.csv'), 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['path', 'weight', 'text_groups', 'detected_groups', 'caption'])
-        for path, caption in sorted(captions.items()):
-            T = text_groups(caption)
-            if path not in aus:
-                w, D = args.w_missing, None
-                n_missing += 1
             else:
-                D = detected_groups(aus[path], args.threshold)
-                if args.score == 'precision':
-                    s = len(T & D) / len(T) if T else 1.0
-                else:  # jaccard
-                    s = len(T & D) / len(T | D) if (T | D) else 1.0
-                w = max(args.w_min, s)
-                scores.append(s)
-            weights[path] = round(w, 4)
-            writer.writerow([path, f'{w:.4f}', ' '.join(sorted(T)),
-                             '' if D is None else ' '.join(sorted(D)), caption])
+                no_face.add(row['path'])
 
-    with open(os.path.join(args.out_dir, 'au_weights.json'), 'w') as f:
+    # LLM AU profile. Centering removes what every target shares (same instruction tokens,
+    # "a face"); per-group z-score removes the fixed offset between text-only prototypes
+    # and image+instruction targets.
+    Xc = X - X.mean(0)
+    Xc /= np.linalg.norm(Xc, axis=1, keepdims=True)
+    Pc = P - P.mean(0)
+    Pc /= np.linalg.norm(Pc, axis=1, keepdims=True)
+    L = zscore(Xc @ Pc.T)                                        # (N, G)
+
+    idx = [i for i, p in enumerate(paths) if p in aus]
+    A = np.array([[max(aus[paths[i]].get(a, 0.0) for a in AU_GROUPS[g][0]) for g in GROUPS] for i in idx])
+    La, Za = L[idx], zscore(A)
+    # agreement per image: Pearson across the AU groups of the two z-scored profiles
+    a = La - La.mean(1, keepdims=True)
+    b = Za - Za.mean(1, keepdims=True)
+    s = (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-8)
+    u = ranks(s) / max(len(s) - 1, 1) if args.map == 'rank' else np.clip((s + 1) / 2, 0, 1)
+    w = args.w_min + (1 - args.w_min) * u
+
+    tag = f'{args.pool}-{args.proto}'
+    weights = {paths[i]: round(float(wi), 4) for i, wi in zip(idx, w)}
+    weights.update({p: args.w_missing for p in paths if p in no_face})
+    with open(os.path.join(args.out_dir, f'au_weights_{tag}.json'), 'w') as f:
         json.dump(weights, f)
-    ws = sorted(weights.values())
-    print(f'{len(weights)} images, {n_missing} without detected face (w={args.w_missing})')
-    if ws:
-        print(f'weight mean {sum(ws) / len(ws):.3f}, median {ws[len(ws) // 2]:.3f}, '
-              f'== w_min: {sum(w <= args.w_min for w in ws)}')
-    if scores:
-        print(f'score == 0 (caption fully contradicts detector): {sum(s == 0 for s in scores)}')
+
+    cls = lambda p: p.split('/')[0]
+    top = lambda v: ' '.join(GROUPS[j] for j in np.argsort(-v)[:3])
+    with open(os.path.join(args.out_dir, f'au_weights_debug_{tag}.csv'), 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['path', 'class', 'weight', 'agreement', 'llm_top3', 'detector_top3'])
+        for k, i in enumerate(idx):
+            writer.writerow([paths[i], cls(paths[i]), f'{w[k]:.4f}', f'{s[k]:.4f}', top(La[k]), top(Za[k])])
+
+    # sanity 1: mean profile per CAER-S class (LLM and detector side by side)
+    classes = sorted({cls(paths[i]) for i in idx})
+    with open(os.path.join(args.out_dir, f'sanity_class_profile_{tag}.csv'), 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['source', 'class'] + GROUPS)
+        for source, M in [('llm', La), ('detector', Za)]:
+            for c in classes:
+                rows = [k for k, i in enumerate(idx) if cls(paths[i]) == c]
+                writer.writerow([source, c] + [f'{v:.3f}' for v in M[rows].mean(0)])
+
+    # sanity 2: per-group Spearman between LLM score and detector probability, over images
+    rho = [np.corrcoef(ranks(La[:, g]), ranks(A[:, g]))[0, 1] for g in range(len(GROUPS))]
+    with open(os.path.join(args.out_dir, f'sanity_spearman_{tag}.csv'), 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['group', 'spearman'])
+        writer.writerows([g, f'{r:.3f}'] for g, r in zip(GROUPS, rho))
+
+    print(f'[{tag}] {len(paths)} targets | {len(idx)} with AUs | {len(no_face)} no face (w={args.w_missing}) | '
+          f'{len(paths) - len(idx) - len(no_face)} not yet AU-detected (skipped)')
+    print(f'agreement mean {s.mean():.3f} std {s.std():.3f} | weight mean {w.mean():.3f} '
+          f'(map {args.map}, w_min {args.w_min})')
+    print('spearman per group: ' + ', '.join(f'{g} {r:+.2f}' for g, r in zip(GROUPS, rho)))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('stage', choices=['caption', 'au', 'weight'])
+    parser.add_argument('stage', choices=['target', 'proto', 'au', 'weight'])
     parser.add_argument('--train-data', type=str, help='ImageFolder root (same as train.py --train-data).')
     parser.add_argument('--out-dir', type=str, required=True)
-    parser.add_argument('--limit', type=int, default=0, help='Only process the first N new images (0 = all).')
+    parser.add_argument('--limit', type=int, default=0, help='Only the first N images of a fixed shuffle (0 = all).')
     parser.add_argument('--batch-size', type=int, default=32)
-    # caption
-    parser.add_argument('--instruction', type=str,
-                        default='Please play the role of a facial action describer. '
-                                'Objectively describe the detailed facial actions of the person in the image.')
-    parser.add_argument('--num-beams', type=int, default=5)
-    parser.add_argument('--max-length', type=int, default=60)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--instruction', type=str, default=DEFAULT_INSTRUCTION)
     # au
     parser.add_argument('--gpu', type=int, default=1, help='1 = run py-feat on CUDA.')
     # weight
-    parser.add_argument('--threshold', type=float, default=0.5, help='AU probability threshold.')
-    parser.add_argument('--score', choices=['jaccard', 'precision'], default='jaccard',
-                        help='jaccard penalises both hallucinated and missed actions; '
-                             'precision penalises only hallucinated ones.')
+    parser.add_argument('--pool', choices=['all', 'img'], default='all',
+                        help='all = training target (all tokens); img = image tokens only.')
+    parser.add_argument('--proto', choices=['plain', 'templ'], default='plain',
+                        help='plain = AU sentence alone; templ = AU sentence after the instruction.')
+    parser.add_argument('--map', choices=['linear', 'rank'], default='linear',
+                        help='agreement -> weight: linear (s+1)/2, or rank percentile.')
     parser.add_argument('--w-min', type=float, default=0.1)
     parser.add_argument('--w-missing', type=float, default=1.0,
                         help='Weight for images where py-feat finds no face.')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    {'caption': stage_caption, 'au': stage_au, 'weight': stage_weight}[args.stage](args)
+    {'target': stage_target, 'proto': stage_proto, 'au': stage_au, 'weight': stage_weight}[args.stage](args)
 
 
 if __name__ == '__main__':
