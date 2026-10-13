@@ -17,6 +17,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import datetime
+import json
+import torch.nn.functional as F
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 import random
@@ -46,6 +48,9 @@ parser.add_argument('--extra-checkpoint-dir', type=str, default=None,
 parser.add_argument('--train-data', type=str,
                      default='/data/EECS-IoannisLab/datasets/Static_FER_Datasets/CAERS_Face/train',
                      help='ImageFolder-style directory of training face images (e.g. CAER-S train).')
+parser.add_argument('--sample-weights', type=str, default=None,
+                     help='JSON {image path relative to --train-data: weight}; weights each sample in the '
+                          'contrastive loss (EXP-001). Images not in the file get weight 1.')
 parser.add_argument('--resume', type=str, default=None,
                      help='Path to a <job-id>-resume.pth file to continue training from the epoch after it.')
 args = parser.parse_args()
@@ -102,9 +107,20 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    train_dataset = datasets.ImageFolder(train_data_file_path,
-                                         transforms.Compose([transforms.Resize((224, 224)),
-                                                             transforms.ToTensor()]))
+    train_transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+    if args.sample_weights:
+        with open(args.sample_weights) as f:
+            sample_weights = json.load(f)
+        train_dataset = WeightedImageFolder(train_data_file_path, train_transform, sample_weights)
+        n_found = sum(os.path.relpath(p, train_data_file_path) in sample_weights for p, _ in train_dataset.samples)
+        w = torch.tensor(train_dataset.sample_weights)
+        info = 'Sample weights: {} / {} images found in {} (others = 1), mean {:.3f}, min {:.3f}'.format(
+            n_found, len(train_dataset), args.sample_weights, w.mean().item(), w.min().item())
+        print(info)
+        with open(log_txt_path, 'a') as f:
+            f.write(info + '\n')
+    else:
+        train_dataset = datasets.ImageFolder(train_data_file_path, train_transform)
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.batch_size,
                                                shuffle=True,
@@ -195,7 +211,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
     # switch to train mode
     model.train()
 
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, sample_w) in enumerate(train_loader):
 
         images = images.cuda()
         n, _, _, _ = images.shape
@@ -207,8 +223,14 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
         logits_per_image = logit_scale * image_features @ text_features.T
         logits_per_text = logit_scale * text_features @ image_features.T
 
-        loss_vision = criterion(logits_per_image, target)
-        loss_text = criterion(logits_per_text, target)
+        if args.sample_weights:
+            # weighted InfoNCE: sample i weights both its image->text and text->image terms
+            sample_w = sample_w.float().cuda()
+            loss_vision = (F.cross_entropy(logits_per_image, target, reduction='none') * sample_w).sum() / sample_w.sum()
+            loss_text = (F.cross_entropy(logits_per_text, target, reduction='none') * sample_w).sum() / sample_w.sum()
+        else:
+            loss_vision = criterion(logits_per_image, target)
+            loss_text = criterion(logits_per_text, target)
         
         loss = 0.5 * loss_vision + 0.5 * loss_text
         
@@ -227,6 +249,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
             progress.display(i)
             
     return top1.avg, losses.avg
+
+
+class WeightedImageFolder(datasets.ImageFolder):
+    """ImageFolder that returns (image, sample weight) instead of (image, class label)."""
+    def __init__(self, root, transform, weights):
+        super().__init__(root, transform)
+        self.sample_weights = [float(weights.get(os.path.relpath(p, root), 1.0)) for p, _ in self.samples]
+
+    def __getitem__(self, index):
+        image, _ = super().__getitem__(index)
+        return image, self.sample_weights[index]
 
 
 class AverageMeter(object):
