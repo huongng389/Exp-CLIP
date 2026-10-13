@@ -295,20 +295,38 @@ def stage_weight(args):
     idx = [i for i, p in enumerate(paths) if p in aus]
     A = np.array([[max(aus[paths[i]].get(a, 0.0) for a in AU_GROUPS[g][0]) for g in GROUPS] for i in idx])
     La, Za = L[idx], zscore(A)
-    # agreement per image: Pearson across the AU groups of the two z-scored profiles
-    a = La - La.mean(1, keepdims=True)
-    b = Za - Za.mean(1, keepdims=True)
+    # agreement per image: Pearson across the selected AU groups of the two z-scored profiles
+    # (test03: brow/lid groups agree at chance for both LLM and py-feat, so they only add noise)
+    sel = [GROUPS.index(g) for g in args.groups.split(',')] if args.groups else list(range(len(GROUPS)))
+    a = La[:, sel] - La[:, sel].mean(1, keepdims=True)
+    b = Za[:, sel] - Za[:, sel].mean(1, keepdims=True)
     s = (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-8)
     u = ranks(s) / max(len(s) - 1, 1) if args.map == 'rank' else np.clip((s + 1) / 2, 0, 1)
     w = args.w_min + (1 - args.w_min) * u
 
-    tag = f'{args.pool}-{args.proto}'
+    cls = lambda p: p.split('/')[0]
+    # test03: clear smiles agree best, so smiling images get higher weights. Rescale each bin
+    # to the global mean weight: 'smile' bins by detector smile probability (label-free),
+    # 'class' by the CAER-S folder (uses labels -> analysis only, not for the zero-shot claim).
+    if args.balance != 'none':
+        if args.balance == 'smile':
+            smile = A[:, GROUPS.index('lip_corner_pull')]
+            bins = np.searchsorted(np.quantile(smile, [0.2, 0.4, 0.6, 0.8]), smile, side='right')
+        else:
+            bins = np.array([cls(paths[i]) for i in idx])
+        target = w.mean()
+        for bval in np.unique(bins):
+            m = bins == bval
+            w[m] *= target / w[m].mean()
+        w = np.clip(w, args.w_min, 1.0)
+
+    tag = args.tag or (f'{args.pool}-{args.proto}' + ('-sel' if args.groups else '')
+                       + ('' if args.balance == 'none' else f'-{args.balance}'))
     weights = {paths[i]: round(float(wi), 4) for i, wi in zip(idx, w)}
     weights.update({p: args.w_missing for p in paths if p in no_face})
     with open(os.path.join(args.out_dir, f'au_weights_{tag}.json'), 'w') as f:
         json.dump(weights, f)
 
-    cls = lambda p: p.split('/')[0]
     top = lambda v: ' '.join(GROUPS[j] for j in np.argsort(-v)[:3])
     with open(os.path.join(args.out_dir, f'au_weights_debug_{tag}.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
@@ -335,8 +353,8 @@ def stage_weight(args):
 
     print(f'[{tag}] {len(paths)} targets | {len(idx)} with AUs | {len(no_face)} no face (w={args.w_missing}) | '
           f'{len(paths) - len(idx) - len(no_face)} not yet AU-detected (skipped)')
-    print(f'agreement mean {s.mean():.3f} std {s.std():.3f} | weight mean {w.mean():.3f} '
-          f'(map {args.map}, w_min {args.w_min})')
+    print(f'agreement over {len(sel)} groups: mean {s.mean():.3f} std {s.std():.3f} | weight mean {w.mean():.3f} '
+          f'std {w.std():.3f} (map {args.map}, balance {args.balance}, w_min {args.w_min})')
     print('spearman per group: ' + ', '.join(f'{g} {r:+.2f}' for g, r in zip(GROUPS, rho)))
 
 
@@ -358,6 +376,12 @@ def main():
                         help='plain = AU sentence alone; templ = AU sentence after the instruction.')
     parser.add_argument('--map', choices=['linear', 'rank'], default='linear',
                         help='agreement -> weight: linear (s+1)/2, or rank percentile.')
+    parser.add_argument('--groups', type=str, default='',
+                        help='Comma-separated AU groups used for the agreement (default: all 13).')
+    parser.add_argument('--balance', choices=['none', 'smile', 'class'], default='none',
+                        help='Equalise mean weight across smile-probability quintiles (label-free) '
+                             'or CAER-S classes (uses labels, analysis only).')
+    parser.add_argument('--tag', type=str, default='', help='Output name suffix (default: built from options).')
     parser.add_argument('--w-min', type=float, default=0.1)
     parser.add_argument('--w-missing', type=float, default=1.0,
                         help='Weight for images where py-feat finds no face.')
