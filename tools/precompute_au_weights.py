@@ -308,12 +308,21 @@ def stage_weight(args):
     # test03: clear smiles agree best, so smiling images get higher weights. Rescale each bin
     # to the global mean weight: 'smile' bins by detector smile probability (label-free),
     # 'class' by the CAER-S folder (uses labels -> analysis only, not for the zero-shot claim).
-    if args.balance != 'none':
-        if args.balance == 'smile':
-            smile = A[:, GROUPS.index('lip_corner_pull')]
-            bins = np.searchsorted(np.quantile(smile, [0.2, 0.4, 0.6, 0.8]), smile, side='right')
-        else:
-            bins = np.array([cls(paths[i]) for i in idx])
+    if args.balance == 'smile':
+        smile = A[:, GROUPS.index('lip_corner_pull')]
+        bins = np.searchsorted(np.quantile(smile, [0.2, 0.4, 0.6, 0.8]), smile, side='right')
+    elif args.balance == 'class':
+        bins = np.array([cls(paths[i]) for i in idx])
+    else:
+        bins = np.zeros(len(idx), dtype=int)
+    if args.drop > 0:
+        # EXP-001 seed1: soft weights (mostly 0.45-0.85) changed nothing, so drop the images
+        # that agree least (w=0) and keep the rest at w=1. Drop the same fraction in every bin.
+        w = np.ones(len(idx))
+        for bval in np.unique(bins):
+            m = np.where(bins == bval)[0]
+            w[m[np.argsort(s[m])[:int(round(args.drop * len(m)))]]] = 0.0
+    elif args.balance != 'none':
         target = w.mean()
         for bval in np.unique(bins):
             m = bins == bval
@@ -321,7 +330,8 @@ def stage_weight(args):
         w = np.clip(w, args.w_min, 1.0)
 
     tag = args.tag or (f'{args.pool}-{args.proto}' + ('-sel' if args.groups else '')
-                       + ('' if args.balance == 'none' else f'-{args.balance}'))
+                       + ('' if args.balance == 'none' else f'-{args.balance}')
+                       + (f'-drop{round(args.drop * 100)}' if args.drop > 0 else ''))
     weights = {paths[i]: round(float(wi), 4) for i, wi in zip(idx, w)}
     weights.update({p: args.w_missing for p in paths if p in no_face})
     with open(os.path.join(args.out_dir, f'au_weights_{tag}.json'), 'w') as f:
@@ -355,6 +365,12 @@ def stage_weight(args):
           f'{len(paths) - len(idx) - len(no_face)} not yet AU-detected (skipped)')
     print(f'agreement over {len(sel)} groups: mean {s.mean():.3f} std {s.std():.3f} | weight mean {w.mean():.3f} '
           f'std {w.std():.3f} (map {args.map}, balance {args.balance}, w_min {args.w_min})')
+    if args.drop > 0:
+        kept = s[w > 0]
+        print(f'drop {args.drop:.0%}: {int((w == 0).sum())} images w=0 | agreement kept min {kept.min():.3f} '
+              f'mean {kept.mean():.3f} | dropped per class: '
+              + ', '.join(f'{c} {np.mean([w[k] == 0 for k, i in enumerate(idx) if cls(paths[i]) == c]):.0%}'
+                          for c in sorted({cls(p) for p in paths})))
     print('spearman per group: ' + ', '.join(f'{g} {r:+.2f}' for g, r in zip(GROUPS, rho)))
 
 
@@ -383,6 +399,9 @@ def main():
                              'or CAER-S classes (uses labels, analysis only).')
     parser.add_argument('--tag', type=str, default='', help='Output name suffix (default: built from options).')
     parser.add_argument('--w-min', type=float, default=0.1)
+    parser.add_argument('--drop', type=float, default=0.0,
+                        help='Hard filter: w=0 for this fraction of lowest-agreement images (per --balance bin), '
+                             'w=1 for the rest. Overrides --map/--w-min.')
     parser.add_argument('--w-missing', type=float, default=1.0,
                         help='Weight for images where py-feat finds no face.')
     args = parser.parse_args()
