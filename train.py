@@ -11,7 +11,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-from models.Exp_CLIP import ExpCLIP_Train 
+from models.Exp_CLIP import ExpCLIP_Train, ExpCLIP_Cached
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -51,6 +51,13 @@ parser.add_argument('--train-data', type=str,
 parser.add_argument('--sample-weights', type=str, default=None,
                      help='JSON {image path relative to --train-data: weight}; weights each sample in the '
                           'contrastive loss (EXP-001). Images not in the file get weight 1.')
+parser.add_argument('--cache-clip', type=str, default=None,
+                     help='npz from tools/cache_clip_features.py. With --cache-targets, train on cached '
+                          'CLIP features and BLIP-2 targets instead of images (EXP-003): no CLIP/BLIP-2 forward.')
+parser.add_argument('--cache-targets', type=str, default=None,
+                     help='Directory of chunk_*.npz from tools/precompute_au_weights.py stage target (pool all).')
+parser.add_argument('--save-epochs', nargs='+', type=int, default=[],
+                     help='Also keep the head after these epochs (1-based) as <job-id>-e<N>-model.pth.')
 parser.add_argument('--resume', type=str, default=None,
                      help='Path to a <job-id>-resume.pth file to continue training from the epoch after it.')
 args = parser.parse_args()
@@ -82,7 +89,7 @@ def main():
     recorder = RecorderMeter(args.epochs)
 
     # create model and load pre_trained parameters
-    model = ExpCLIP_Train(args)
+    model = ExpCLIP_Cached(args) if args.cache_clip else ExpCLIP_Train(args)
 
     # only open learnable part
     for name, param in model.named_parameters():
@@ -108,7 +115,18 @@ def main():
 
     # Data loading code
     train_transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
-    if args.sample_weights:
+    if args.cache_clip:
+        sample_weights = None
+        if args.sample_weights:
+            with open(args.sample_weights) as f:
+                sample_weights = json.load(f)
+        train_dataset = CachedPairs(args.cache_clip, args.cache_targets, sample_weights)
+        info = 'Cached training: {} pairs ({} CLIP features without a target skipped), weights mean {:.3f}'.format(
+            len(train_dataset), train_dataset.n_skipped, train_dataset.sample_weights.mean().item())
+        print(info)
+        with open(log_txt_path, 'a') as f:
+            f.write(info + '\n')
+    elif args.sample_weights:
         with open(args.sample_weights) as f:
             sample_weights = json.load(f)
         train_dataset = WeightedImageFolder(train_data_file_path, train_transform, sample_weights)
@@ -124,7 +142,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.batch_size,
                                                shuffle=True,
-                                               num_workers=args.workers,
+                                               num_workers=0 if args.cache_clip else args.workers,
                                                pin_memory=True, 
                                                drop_last=True)
 
@@ -190,6 +208,11 @@ def main():
             shutil.copy2(epoch_checkpoint_name, args.extra_checkpoint_dir)
             shutil.copy2(resume_path, args.extra_checkpoint_dir)
             shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
+        if epoch + 1 in args.save_epochs:
+            kept_name = checkpoint_path + '-e' + str(epoch + 1) + '-model.pth'
+            shutil.copy2(epoch_checkpoint_name, kept_name)
+            if args.extra_checkpoint_dir:
+                shutil.copy2(kept_name, args.extra_checkpoint_dir)
 
     #  save model and conduct zero-shot prediction
     checkpoint_name = checkpoint_path + '-model.pth'
@@ -211,14 +234,18 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
     # switch to train mode
     model.train()
 
-    for i, (images, sample_w) in enumerate(train_loader):
-
-        images = images.cuda()
-        n, _, _, _ = images.shape
-        target = torch.arange(n).cuda()
+    for i, (inputs, sample_w) in enumerate(train_loader):
 
         # compute output
-        logit_scale, image_features, text_features = model(image=images)
+        if args.cache_clip:
+            clip_features, target_features = inputs
+            n = clip_features.size(0)
+            logit_scale, image_features, text_features = model(clip_features.cuda(), target_features.cuda())
+        else:
+            images = inputs.cuda()
+            n = images.size(0)
+            logit_scale, image_features, text_features = model(image=images)
+        target = torch.arange(n).cuda()
         
         logits_per_image = logit_scale * image_features @ text_features.T
         logits_per_text = logit_scale * text_features @ image_features.T
@@ -236,8 +263,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
         
         # measure accuracy and record loss
         acc1, _ = accuracy(logits_per_image, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
+        losses.update(loss.item(), n)
+        top1.update(acc1[0], n)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -260,6 +287,31 @@ class WeightedImageFolder(datasets.ImageFolder):
     def __getitem__(self, index):
         image, _ = super().__getitem__(index)
         return image, self.sample_weights[index]
+
+
+class CachedPairs(torch.utils.data.Dataset):
+    """(CLIP feature, BLIP-2 target) pairs cached on disk, matched by image path (EXP-003).
+    Returns ((clip feature, target), sample weight); weights default to 1."""
+    def __init__(self, clip_npz, target_dir, weights=None):
+        import glob
+        clip = np.load(clip_npz)
+        chunks = sorted(glob.glob(os.path.join(target_dir, 'chunk_*.npz')))
+        targets = {}
+        for c in chunks:
+            d = np.load(c)
+            targets.update(zip(d['paths'], d['all']))
+        keep = [i for i, p in enumerate(clip['paths']) if p in targets]
+        self.n_skipped = len(clip['paths']) - len(keep)
+        paths = [clip['paths'][i] for i in keep]
+        self.clip_features = torch.from_numpy(clip['feats'][keep])
+        self.targets = torch.from_numpy(np.stack([targets[p] for p in paths]))
+        self.sample_weights = torch.tensor([float((weights or {}).get(p, 1.0)) for p in paths])
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, index):
+        return (self.clip_features[index], self.targets[index]), self.sample_weights[index]
 
 
 class AverageMeter(object):

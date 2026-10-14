@@ -46,6 +46,42 @@ class ExpCLIP_Train(nn.Module):
         return logit_scale, image_features, text_features
 
 
+class ExpCLIP_Cached(nn.Module):
+    """ExpCLIP_Train on cached inputs (EXP-003): frozen CLIP image features and BLIP-2 targets are
+    read from disk (train.py --cache-clip/--cache-targets), so only the projection head runs."""
+    def __init__(self, args):
+        super().__init__()
+
+        device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+
+        # load CLIP before creating the head, as ExpCLIP_Train does, so the head gets the same
+        # random init for a given seed; only logit_scale is kept
+        if args.load_model == 'CLIP_B32':
+            clip_model, _ = clip.load("ViT-B/32", device)
+        elif args.load_model == 'CLIP_B16':
+            clip_model, _ = clip.load("ViT-B/16", device)
+        elif args.load_model == 'CLIP_L14':
+            clip_model, _ = clip.load("ViT-L/14", device)
+
+        if args.load_model == 'CLIP_L14':
+            self.projection_head = Linear_Matrix_L14()
+        else:
+            self.projection_head = Linear_Matrix()
+
+        self.register_buffer("logit_scale", clip_model.logit_scale.detach().clone())
+        del clip_model
+
+    def forward(self, clip_features, target_features):
+
+        image_features = self.projection_head(clip_features.float())
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        text_features = target_features.float()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        return self.logit_scale.exp(), image_features, text_features
+
+
 class ExpCLIP_Test(nn.Module):
     def __init__(self, args):
         super().__init__()
