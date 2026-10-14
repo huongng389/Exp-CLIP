@@ -56,6 +56,14 @@ parser.add_argument('--cache-clip', type=str, default=None,
                           'CLIP features and BLIP-2 targets instead of images (EXP-003): no CLIP/BLIP-2 forward.')
 parser.add_argument('--cache-targets', type=str, default=None,
                      help='Directory of chunk_*.npz from tools/precompute_au_weights.py stage target (pool all).')
+parser.add_argument('--text-bank', type=str, default=None,
+                     help='npz from tools/build_text_bank.py. Adds the text-anchor loss (EXP-004); '
+                          'needs --cache-clip.')
+parser.add_argument('--anchor-weight', type=float, default=1.0,
+                     help='lambda: loss = InfoNCE + lambda * anchor loss (0 = only log the anchor loss).')
+parser.add_argument('--anchor-type', type=str, default='cross', choices=['cross', 'text'],
+                     help='cross: KL between CLIP and projected image->text-bank softmax; '
+                          'text: MSE between CLIP and projected text-bank cosine matrices.')
 parser.add_argument('--save-epochs', nargs='+', type=int, default=[],
                      help='Also keep the head after these epochs (1-based) as <job-id>-e<N>-model.pth.')
 parser.add_argument('--resume', type=str, default=None,
@@ -146,6 +154,16 @@ def main():
                                                pin_memory=True, 
                                                drop_last=True)
 
+    text_bank = None
+    if args.text_bank:
+        assert args.cache_clip, '--text-bank needs --cache-clip'
+        text_bank = torch.from_numpy(np.load(args.text_bank)['feats']).float().cuda()
+        info = 'Text anchor: {} sentences from {}, type {}, weight {}'.format(
+            len(text_bank), args.text_bank, args.anchor_type, args.anchor_weight)
+        print(info)
+        with open(log_txt_path, 'a') as f:
+            f.write(info + '\n')
+
     # resume projection head, optimizer, scheduler, curve and RNG states from a previous run
     start_epoch = 0
     if args.resume:
@@ -177,7 +195,7 @@ def main():
             f.write('Current learning rate: ' + str(current_learning_rate) + '\n')      
             
         # train for one epoch
-        train_acc, train_los = train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path)
+        train_acc, train_los = train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path, text_bank)
         scheduler.step()
 
         # print and save log
@@ -223,11 +241,12 @@ def main():
         shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
+def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path, text_bank=None):
     losses = AverageMeter('Loss', ':.4f')
+    anchor_losses = AverageMeter('Anchor', ':.4f')
     top1 = AverageMeter('Accuracy', ':6.3f')
     progress = ProgressMeter(len(train_loader),
-                             [losses, top1],
+                             [losses, anchor_losses, top1] if text_bank is not None else [losses, top1],
                              prefix="Epoch: [{}]".format(epoch),
                              log_txt_path=log_txt_path)
 
@@ -260,6 +279,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
             loss_text = criterion(logits_per_text, target)
         
         loss = 0.5 * loss_vision + 0.5 * loss_text
+        if text_bank is not None:
+            loss_anchor = anchor_loss(model.module.projection_head, clip_features.cuda(), text_bank,
+                                      model.module.logit_scale.exp(), args.anchor_type)
+            anchor_losses.update(loss_anchor.item(), n)
+            loss = loss + args.anchor_weight * loss_anchor
         
         # measure accuracy and record loss
         acc1, _ = accuracy(logits_per_image, target, topk=(1, 5))
@@ -276,6 +300,23 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path):
             progress.display(i)
             
     return top1.avg, losses.avg
+
+
+def anchor_loss(head, clip_features, text_bank, logit_scale, anchor_type):
+    """Text-anchor loss (EXP-004): keep CLIP's geometry on the text side after the head, which at
+    test time is shared by images and prompts but is trained on images only."""
+    def cos(a, b):
+        return F.normalize(a, dim=-1) @ F.normalize(b, dim=-1).T
+    t = text_bank
+    t_proj = head(t)
+    if anchor_type == 'cross':
+        # zero-shot = softmax over texts for each image: match CLIP's image->text-bank distribution
+        x = clip_features.float()
+        p_clip = F.softmax(logit_scale * cos(x, t), dim=-1)
+        log_q = F.log_softmax(logit_scale * cos(head(x), t_proj), dim=-1)
+        return F.kl_div(log_q, p_clip, reduction='batchmean')
+    # 'text': keep the cosine structure among the bank sentences
+    return F.mse_loss(cos(t_proj, t_proj), cos(t, t))
 
 
 class WeightedImageFolder(datasets.ImageFolder):
