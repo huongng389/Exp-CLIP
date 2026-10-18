@@ -1,3 +1,4 @@
+import copy
 import torch
 from torch import nn
 from .clip import clip
@@ -68,6 +69,10 @@ class ExpCLIP_Cached(nn.Module):
         else:
             self.projection_head = Linear_Matrix()
 
+        # EXP-005: separate head for text, initialised as a copy of the image head (no RNG used,
+        # so the image head init is unchanged); trained by the anchor loss only
+        self.text_head = copy.deepcopy(self.projection_head) if getattr(args, 'sep_head', 'none') != 'none' else None
+
         self.register_buffer("logit_scale", clip_model.logit_scale.detach().clone())
         del clip_model
 
@@ -100,6 +105,9 @@ class ExpCLIP_Test(nn.Module):
         else:
             self.projection_head = Linear_Matrix()
 
+        # EXP-005: set by test.py when the checkpoint has a separate text head
+        self.text_head = None
+
     def forward(self, image, text=None, mode_task=None):
         
         if mode_task=='Static_FER':
@@ -120,7 +128,8 @@ class ExpCLIP_Test(nn.Module):
         text_tokenized = clip.tokenize(text, context_length=77, truncate=True).to('cuda')
         text_features = self.clip_model.encode_text(text_tokenized)
         text_features = text_features.float()
-        text_features = self.projection_head(text_features)
+        text_head = self.text_head if self.text_head is not None else self.projection_head
+        text_features = text_head(text_features)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
         logit_scale = self.clip_model.logit_scale.exp()

@@ -64,6 +64,11 @@ parser.add_argument('--anchor-weight', type=float, default=1.0,
 parser.add_argument('--anchor-type', type=str, default='cross', choices=['cross', 'text'],
                      help='cross: KL between CLIP and projected image->text-bank softmax; '
                           'text: MSE between CLIP and projected text-bank cosine matrices.')
+parser.add_argument('--sep-head', type=str, default='none', choices=['none', 'sg', 'joint'],
+                     help='EXP-005: separate text head (copy of the image head at init), trained by the anchor '
+                          'loss. sg: anchor gradients reach only the text head; joint: both heads. none: shared head.')
+parser.add_argument('--head-tie', type=float, default=0.0,
+                     help='mu: adds mu * ||W_text - W_image||^2 (image head detached) with --sep-head.')
 parser.add_argument('--save-epochs', nargs='+', type=int, default=[],
                      help='Also keep the head after these epochs (1-based) as <job-id>-e<N>-model.pth.')
 parser.add_argument('--resume', type=str, default=None,
@@ -103,7 +108,7 @@ def main():
     for name, param in model.named_parameters():
         param.requires_grad = False
     for name, param in model.named_parameters():
-        if "projection_head" in name:
+        if "projection_head" in name or "text_head" in name:
             param.requires_grad = True  
 
     model = torch.nn.DataParallel(model).cuda()
@@ -112,7 +117,11 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()
     
     # define optimizer
-    optimizer = torch.optim.SGD([{"params": model.module.projection_head.parameters(), "lr": args.lr}],
+    param_groups = [{"params": model.module.projection_head.parameters(), "lr": args.lr}]
+    if args.sep_head != 'none':
+        assert args.cache_clip and args.text_bank, '--sep-head needs --cache-clip and --text-bank'
+        param_groups.append({"params": model.module.text_head.parameters(), "lr": args.lr})
+    optimizer = torch.optim.SGD(param_groups,
                                 lr=args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -169,6 +178,8 @@ def main():
     if args.resume:
         state = torch.load(args.resume, map_location='cpu')
         model.module.projection_head.load_state_dict(state['projection_head'])
+        if args.sep_head != 'none':
+            model.module.text_head.load_state_dict(state['text_head'])
         optimizer.load_state_dict(state['optimizer'])
         scheduler.load_state_dict(state['scheduler'])
         start_epoch = state['epoch'] + 1
@@ -211,8 +222,12 @@ def main():
         # save a checkpoint after every epoch so progress survives an interrupted run
         epoch_checkpoint_name = checkpoint_path + '-model.pth'
         torch.save(model.module.projection_head.state_dict(), epoch_checkpoint_name)
+        text_checkpoint_name = checkpoint_path + '-text-model.pth'
+        if args.sep_head != 'none':
+            torch.save(model.module.text_head.state_dict(), text_checkpoint_name)
         torch.save({'epoch': epoch,
                     'projection_head': model.module.projection_head.state_dict(),
+                    'text_head': model.module.text_head.state_dict() if args.sep_head != 'none' else None,
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'epoch_losses': recorder.epoch_losses,
@@ -224,6 +239,8 @@ def main():
         if args.extra_checkpoint_dir:
             os.makedirs(args.extra_checkpoint_dir, exist_ok=True)
             shutil.copy2(epoch_checkpoint_name, args.extra_checkpoint_dir)
+            if args.sep_head != 'none':
+                shutil.copy2(text_checkpoint_name, args.extra_checkpoint_dir)
             shutil.copy2(resume_path, args.extra_checkpoint_dir)
             shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
         if epoch + 1 in args.save_epochs:
@@ -231,13 +248,22 @@ def main():
             shutil.copy2(epoch_checkpoint_name, kept_name)
             if args.extra_checkpoint_dir:
                 shutil.copy2(kept_name, args.extra_checkpoint_dir)
+            if args.sep_head != 'none':
+                kept_text_name = checkpoint_path + '-e' + str(epoch + 1) + '-text-model.pth'
+                shutil.copy2(text_checkpoint_name, kept_text_name)
+                if args.extra_checkpoint_dir:
+                    shutil.copy2(kept_text_name, args.extra_checkpoint_dir)
 
     #  save model and conduct zero-shot prediction
     checkpoint_name = checkpoint_path + '-model.pth'
     torch.save(model.module.projection_head.state_dict(), checkpoint_name)
+    if args.sep_head != 'none':
+        torch.save(model.module.text_head.state_dict(), checkpoint_path + '-text-model.pth')
     if args.extra_checkpoint_dir:
         os.makedirs(args.extra_checkpoint_dir, exist_ok=True)
         shutil.copy2(checkpoint_name, args.extra_checkpoint_dir)
+        if args.sep_head != 'none':
+            shutil.copy2(checkpoint_path + '-text-model.pth', args.extra_checkpoint_dir)
         shutil.copy2(log_txt_path, args.extra_checkpoint_dir)
 
 
@@ -281,9 +307,14 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path, 
         loss = 0.5 * loss_vision + 0.5 * loss_text
         if text_bank is not None:
             loss_anchor = anchor_loss(model.module.projection_head, clip_features.cuda(), text_bank,
-                                      model.module.logit_scale.exp(), args.anchor_type)
+                                      model.module.logit_scale.exp(), args.anchor_type,
+                                      text_head=model.module.text_head, detach_image=args.sep_head == 'sg')
             anchor_losses.update(loss_anchor.item(), n)
             loss = loss + args.anchor_weight * loss_anchor
+            if args.sep_head != 'none' and args.head_tie > 0:
+                w_t = model.module.text_head.mlp.weight
+                w_i = model.module.projection_head.mlp.weight.detach()
+                loss = loss + args.head_tie * (w_t - w_i).pow(2).sum()
         
         # measure accuracy and record loss
         acc1, _ = accuracy(logits_per_image, target, topk=(1, 5))
@@ -302,18 +333,23 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log_txt_path, 
     return top1.avg, losses.avg
 
 
-def anchor_loss(head, clip_features, text_bank, logit_scale, anchor_type):
+def anchor_loss(head, clip_features, text_bank, logit_scale, anchor_type, text_head=None, detach_image=False):
     """Text-anchor loss (EXP-004): keep CLIP's geometry on the text side after the head, which at
-    test time is shared by images and prompts but is trained on images only."""
+    test time is shared by images and prompts but is trained on images only.
+    EXP-005: with text_head, texts go through it instead of the image head; detach_image keeps the
+    anchor gradients out of the image head."""
     def cos(a, b):
         return F.normalize(a, dim=-1) @ F.normalize(b, dim=-1).T
     t = text_bank
-    t_proj = head(t)
+    t_proj = (text_head if text_head is not None else head)(t)
     if anchor_type == 'cross':
         # zero-shot = softmax over texts for each image: match CLIP's image->text-bank distribution
         x = clip_features.float()
+        x_proj = head(x)
+        if detach_image:
+            x_proj = x_proj.detach()
         p_clip = F.softmax(logit_scale * cos(x, t), dim=-1)
-        log_q = F.log_softmax(logit_scale * cos(head(x), t_proj), dim=-1)
+        log_q = F.log_softmax(logit_scale * cos(x_proj, t_proj), dim=-1)
         return F.kl_div(log_q, p_clip, reduction='batchmean')
     # 'text': keep the cosine structure among the bank sentences
     return F.mse_loss(cos(t_proj, t_proj), cos(t, t))

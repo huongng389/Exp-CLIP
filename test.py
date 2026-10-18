@@ -1,3 +1,4 @@
+import copy
 import os
 import torch
 import torch.nn.parallel
@@ -35,6 +36,12 @@ print('************************')
 
 # create model and load pre_trained parameters
 model = ExpCLIP_Test(args)
+# EXP-005: a separate text head is saved next to the image head as <job-id>-text-model.pth
+text_model_path = './checkpoint/' + args.job_id + "-text-model.pth"
+if os.path.exists(text_model_path):
+    model.text_head = copy.deepcopy(model.projection_head)
+    model.text_head.load_state_dict(torch.load(text_model_path, map_location='cpu'))
+    print('Separate text head loaded from', text_model_path)
 model = torch.nn.DataParallel(model).cuda() 
 state_dict = model.state_dict()
 pre_train_model = torch.load(pretrain_model_path)
