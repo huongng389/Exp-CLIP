@@ -310,3 +310,79 @@ FER_prompt_list = [
     "MAFW": expression_ensemble_ten[0:110],
     "AFEW": expression_ensemble_ten[0:70]}
 ]
+
+# EXP-007: class prompts described by facial action units (FACS), fixed from the EMFACS
+# prototypes (Ekman & Friesen) before looking at any test result. Same class order as
+# emotion_name_for_cm[0:8]; each class has 5 phrasings of its AU combination.
+au_phrases = [
+    # Happiness: AU6 + AU12
+    ["raised cheeks and lip corners pulled up",
+     "a smile with lip corners pulled up and back",
+     "cheeks raised and crow's feet wrinkles around the eyes",
+     "a smiling mouth and narrowed eyes from raised cheeks",
+     "lip corners pulled upward and raised cheeks pushing up the lower eyelids"],
+    # Sadness: AU1 + AU4 + AU15 (+ AU17)
+    ["inner brows raised and lip corners pulled down",
+     "inner corners of the eyebrows drawn up and together",
+     "lip corners depressed and the chin pushed up",
+     "slanted eyebrows raised in the middle and a downturned mouth",
+     "drooping upper eyelids and lip corners pulled downward"],
+    # Neutral: no action unit
+    ["relaxed eyebrows, eyes and mouth",
+     "no visible facial muscle movement",
+     "lips closed and relaxed and eyebrows at rest",
+     "a still face with no raised or lowered brows",
+     "a calm face with relaxed muscles around the eyes and mouth"],
+    # Anger: AU4 + AU5 + AU7 + AU23 (+ AU24)
+    ["eyebrows lowered and drawn together",
+     "a glaring stare with tightened eyelids",
+     "lips pressed tightly together and lowered brows",
+     "a furrowed brow and narrowed, staring eyes",
+     "brows pulled down and together, eyelids tensed and lips tightened"],
+    # Surprise: AU1 + AU2 + AU5 + AU26
+    ["eyebrows raised high and eyes wide open",
+     "the jaw dropped and the mouth hanging open",
+     "upper eyelids raised showing the whites of the eyes",
+     "arched eyebrows with horizontal wrinkles across the forehead",
+     "raised brows, widened eyes and a dropped jaw"],
+    # Disgust: AU9 + AU15 + AU16 (+ AU10)
+    ["a wrinkled nose and raised upper lip",
+     "the nose wrinkled and the upper lip pulled up",
+     "the lower lip pushed down and lip corners depressed",
+     "wrinkles along the sides of the nose and a curled upper lip",
+     "a raised upper lip, wrinkled nose and lowered brows"],
+    # Fear: AU1 + AU2 + AU4 + AU5 + AU7 + AU20 + AU26
+    ["eyebrows raised and drawn together and eyes wide open",
+     "lips stretched horizontally toward the ears",
+     "upper eyelids raised and lower eyelids tensed",
+     "raised, pinched eyebrows and a slightly open, stretched mouth",
+     "wide eyes, raised brows pulled together and lips stretched back"],
+    # Contempt: unilateral AU12 + AU14
+    ["one lip corner tightened and raised",
+     "an asymmetric smirk on one side of the mouth",
+     "a dimple on one side from a tightened lip corner",
+     "one side of the mouth pulled up and back",
+     "a one-sided lip raise with a slight sneer"],
+]
+
+au_noun = ["happiness", "sadness", "neutral", "anger", "surprise", "disgust", "fear", "contempt"]
+
+# AU only: no emotion word at all
+au_description_five = [f"a photo of a face with {p}." for phrases in au_phrases for p in phrases]
+# emotion name + AU description
+name_with_au_five = [f"a photo of a face with an expression of {n}, with {p}."
+                     for n, phrases in zip(au_noun, au_phrases) for p in phrases]
+# Expression Ensemble Five + Name + AU (10 per class, grouped by class as test.py expects)
+ensemble_five_with_au = [s for c in range(8)
+                         for s in expression_ensemble_five[5 * c:5 * c + 5] + name_with_au_five[5 * c:5 * c + 5]]
+
+AU_prompt_type_list = [
+    'AU Description Five',
+    'Name with AU Five',
+    'Ensemble Five with AU',
+]
+
+AU_prompt_list = [
+    {"RAFDB": l[:k * 7], "AffectNet7": l[:k * 7], "AffectNet8": l[:k * 8], "FERPlus": l[:k * 8]}
+    for l, k in [(au_description_five, 5), (name_with_au_five, 5), (ensemble_five_with_au, 10)]
+]
