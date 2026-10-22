@@ -25,6 +25,7 @@ import random
 from models.clip import clip
 from models.BLIP2_T5 import *
 from models.Text import *
+from data_loader.image_transform import image_transform, PREPROCESS_CHOICES
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 parser = argparse.ArgumentParser()
@@ -73,6 +74,9 @@ parser.add_argument('--save-epochs', nargs='+', type=int, default=[],
                      help='Also keep the head after these epochs (1-based) as <job-id>-e<N>-model.pth.')
 parser.add_argument('--resume', type=str, default=None,
                      help='Path to a <job-id>-resume.pth file to continue training from the epoch after it.')
+parser.add_argument('--preprocess', type=str, default='raw', choices=PREPROCESS_CHOICES,
+                     help='raw: original Resize + ToTensor; clip: + bicubic and CLIP mean/std (EXP-009). '
+                          'With --cache-clip the caches must have been built with the same setting.')
 args = parser.parse_args()
 
 random.seed(args.seed)  
@@ -131,7 +135,7 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    train_transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+    train_transform = image_transform(args.preprocess)
     if args.cache_clip:
         sample_weights = None
         if args.sample_weights:

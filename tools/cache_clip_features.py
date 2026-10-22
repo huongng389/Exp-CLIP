@@ -16,11 +16,11 @@ import sys
 import numpy as np
 import torch
 import torchvision.datasets as datasets
-import torchvision.transforms as transforms
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 from models.clip import clip  # noqa: E402
+from data_loader.image_transform import image_transform, PREPROCESS_CHOICES  # noqa: E402
 
 CLIP_NAMES = {'CLIP_B32': 'ViT-B/32', 'CLIP_B16': 'ViT-B/16', 'CLIP_L14': 'ViT-L/14'}
 
@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--load-model', type=str, default='CLIP_L14', choices=list(CLIP_NAMES))
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--preprocess', type=str, default='raw', choices=PREPROCESS_CHOICES)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -39,8 +40,7 @@ def main():
     model.eval()
 
     # same transform as train.py
-    dataset = datasets.ImageFolder(args.train_data, transforms.Compose([transforms.Resize((224, 224)),
-                                                                        transforms.ToTensor()]))
+    dataset = datasets.ImageFolder(args.train_data, image_transform(args.preprocess))
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                          num_workers=args.workers, pin_memory=True)
     feats = []

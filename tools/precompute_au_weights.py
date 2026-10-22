@@ -149,7 +149,6 @@ def stage_target(args):
     import numpy as np
     import torch
     import torch.nn.functional as F
-    import torchvision.transforms as transforms
     from PIL import Image
 
     tdir = os.path.join(args.out_dir, 'targets')
@@ -162,7 +161,9 @@ def stage_target(args):
         return
 
     # same preprocessing as train.py, so the vectors are exactly the training targets
-    tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+    sys.path.insert(0, REPO_ROOT)
+    from data_loader.image_transform import image_transform
+    tf = image_transform(args.preprocess)
 
     class Images(torch.utils.data.Dataset):
         def __len__(self):
@@ -383,6 +384,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--instruction', type=str, default=DEFAULT_INSTRUCTION)
+    parser.add_argument('--preprocess', choices=['raw', 'clip'], default='raw',
+                        help='target: raw = original Resize + ToTensor; clip = + bicubic and CLIP mean/std (EXP-009).')
     # au
     parser.add_argument('--gpu', type=int, default=1, help='1 = run py-feat on CUDA.')
     # weight

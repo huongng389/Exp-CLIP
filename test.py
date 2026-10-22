@@ -18,6 +18,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
 import itertools
+from data_loader.image_transform import image_transform, PREPROCESS_CHOICES
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--load-model', type=str)
@@ -25,6 +26,8 @@ parser.add_argument('--job-id', type=str)
 parser.add_argument('--data-root', type=str, default='./data/static_test_sets',
                      help='Directory containing RAFDB/test, AffectNet7/test, AffectNet8/test, FERPlus/test '
                           '(each an ImageFolder with 0_Happiness, 1_Sadness, ... subfolders).')
+parser.add_argument('--preprocess', type=str, default='raw', choices=PREPROCESS_CHOICES,
+                     help='raw: original Resize + ToTensor; clip: + bicubic and CLIP mean/std (EXP-009).')
 args = parser.parse_args()
 pretrain_model_path = './checkpoint/' + args.job_id + "-model.pth"
 
@@ -67,9 +70,7 @@ def zero_shot_test(dataset_=None, FER_prompt_=None, prompt_type=None):
         prompt_number = int(len(zero_shot_prompt) / 8)
 
     batch_size_ = 512
-    test_data = datasets.ImageFolder(test_data_path,
-                                     transforms.Compose([transforms.Resize((224, 224)),
-                                                         transforms.ToTensor()]))
+    test_data = datasets.ImageFolder(test_data_path, image_transform(args.preprocess))
     confusion_matrix_path = "./confusion_matrix/"+args.load_model+"-"+dataset_+'-'+prompt_type+'.pdf'
 
     test_loader = torch.utils.data.DataLoader(test_data,
