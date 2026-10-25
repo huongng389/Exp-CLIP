@@ -64,10 +64,12 @@ class ExpCLIP_Cached(nn.Module):
         elif args.load_model == 'CLIP_L14':
             clip_model, _ = clip.load("ViT-L/14", device)
 
+        # EXP-012: output dim = LLM hidden size (4096 for FlanT5-XXL, 3584 for Qwen2.5-VL-7B)
+        llm_dim = getattr(args, 'llm_dim', None) or 4096
         if args.load_model == 'CLIP_L14':
-            self.projection_head = Linear_Matrix_L14()
+            self.projection_head = Linear_Matrix_L14(llm_dim)
         else:
-            self.projection_head = Linear_Matrix()
+            self.projection_head = Linear_Matrix(llm_dim)
 
         # EXP-005: separate head for text, initialised as a copy of the image head (no RNG used,
         # so the image head init is unchanged); trained by the anchor loss only
@@ -100,10 +102,12 @@ class ExpCLIP_Test(nn.Module):
         elif args.load_model == 'CLIP_L14':
             self.clip_model, _ = clip.load("ViT-L/14", device)
 
+        # EXP-012: output dim = LLM hidden size (4096 for FlanT5-XXL, 3584 for Qwen2.5-VL-7B)
+        llm_dim = getattr(args, 'llm_dim', None) or 4096
         if args.load_model == 'CLIP_L14':
-            self.projection_head = Linear_Matrix_L14()
+            self.projection_head = Linear_Matrix_L14(llm_dim)
         else:
-            self.projection_head = Linear_Matrix()
+            self.projection_head = Linear_Matrix(llm_dim)
 
         # EXP-005: set by test.py when the checkpoint has a separate text head
         self.text_head = None
@@ -138,16 +142,16 @@ class ExpCLIP_Test(nn.Module):
 
 
 class Linear_Matrix(nn.Module):
-    def __init__(self):
+    def __init__(self, out_dim=4096):
         super().__init__()
-        self.mlp = nn.Linear(512, 4096, bias=False)
+        self.mlp = nn.Linear(512, out_dim, bias=False)
     def forward(self, x):
         return self.mlp(x)
 
 
 class Linear_Matrix_L14(nn.Module):
-    def __init__(self):
+    def __init__(self, out_dim=4096):
         super().__init__()
-        self.mlp = nn.Linear(768, 4096, bias=False)
+        self.mlp = nn.Linear(768, out_dim, bias=False)
     def forward(self, x):
         return self.mlp(x)

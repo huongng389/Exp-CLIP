@@ -56,7 +56,11 @@ parser.add_argument('--cache-clip', type=str, default=None,
                      help='npz from tools/cache_clip_features.py. With --cache-targets, train on cached '
                           'CLIP features and BLIP-2 targets instead of images (EXP-003): no CLIP/BLIP-2 forward.')
 parser.add_argument('--cache-targets', type=str, default=None,
-                     help='Directory of chunk_*.npz from tools/precompute_au_weights.py stage target (pool all).')
+                     help='Directory of chunk_*.npz from tools/precompute_au_weights.py stage target (pool all) '
+                          'or tools/precompute_qwen_targets.py (EXP-012).')
+parser.add_argument('--cache-pool', type=str, default='all',
+                     help='Which array of the target chunks to train on (EXP-012: all | img | last | mid_all). '
+                          'The head output size follows the target size.')
 parser.add_argument('--text-bank', type=str, default=None,
                      help='npz from tools/build_text_bank.py. Adds the text-anchor loss (EXP-004); '
                           'needs --cache-clip.')
@@ -106,6 +110,11 @@ def main():
     recorder = RecorderMeter(args.epochs)
 
     # create model and load pre_trained parameters
+    if args.cache_clip:
+        # EXP-012: head output size = target size (4096 for BLIP-2, 3584 for Qwen2.5-VL-7B)
+        import glob
+        first_chunk = sorted(glob.glob(os.path.join(args.cache_targets, 'chunk_*.npz')))[0]
+        args.llm_dim = np.load(first_chunk)[args.cache_pool].shape[-1]
     model = ExpCLIP_Cached(args) if args.cache_clip else ExpCLIP_Train(args)
 
     # only open learnable part
@@ -141,9 +150,10 @@ def main():
         if args.sample_weights:
             with open(args.sample_weights) as f:
                 sample_weights = json.load(f)
-        train_dataset = CachedPairs(args.cache_clip, args.cache_targets, sample_weights)
-        info = 'Cached training: {} pairs ({} CLIP features without a target skipped), weights mean {:.3f}'.format(
-            len(train_dataset), train_dataset.n_skipped, train_dataset.sample_weights.mean().item())
+        train_dataset = CachedPairs(args.cache_clip, args.cache_targets, sample_weights, args.cache_pool)
+        info = 'Cached training: {} pairs ({} CLIP features without a target skipped), weights mean {:.3f}, pool {}, dim {}'.format(
+            len(train_dataset), train_dataset.n_skipped, train_dataset.sample_weights.mean().item(),
+            args.cache_pool, args.llm_dim)
         print(info)
         with open(log_txt_path, 'a') as f:
             f.write(info + '\n')
@@ -373,14 +383,14 @@ class WeightedImageFolder(datasets.ImageFolder):
 class CachedPairs(torch.utils.data.Dataset):
     """(CLIP feature, BLIP-2 target) pairs cached on disk, matched by image path (EXP-003).
     Returns ((clip feature, target), sample weight); weights default to 1."""
-    def __init__(self, clip_npz, target_dir, weights=None):
+    def __init__(self, clip_npz, target_dir, weights=None, pool='all'):
         import glob
         clip = np.load(clip_npz)
         chunks = sorted(glob.glob(os.path.join(target_dir, 'chunk_*.npz')))
         targets = {}
         for c in chunks:
             d = np.load(c)
-            targets.update(zip(d['paths'], d['all']))
+            targets.update(zip(d['paths'], d[pool]))
         keep = [i for i, p in enumerate(clip['paths']) if p in targets]
         self.n_skipped = len(clip['paths']) - len(keep)
         paths = [clip['paths'][i] for i in keep]

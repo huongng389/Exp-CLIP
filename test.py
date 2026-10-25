@@ -38,6 +38,9 @@ print('************************')
 
 
 # create model and load pre_trained parameters
+pre_train_model = torch.load(pretrain_model_path)
+# EXP-012: head output size from the checkpoint (4096 for BLIP-2 targets, 3584 for Qwen2.5-VL-7B)
+args.llm_dim = next(v for k, v in pre_train_model.items() if "mlp.weight" in k).shape[0]
 model = ExpCLIP_Test(args)
 # EXP-005: a separate text head is saved next to the image head as <job-id>-text-model.pth
 text_model_path = './checkpoint/' + args.job_id + "-text-model.pth"
@@ -47,7 +50,6 @@ if os.path.exists(text_model_path):
     print('Separate text head loaded from', text_model_path)
 model = torch.nn.DataParallel(model).cuda() 
 state_dict = model.state_dict()
-pre_train_model = torch.load(pretrain_model_path)
 for name, param in pre_train_model.items():
     if "mlp.weight" in name:
         state_dict["module.projection_head.mlp.weight"].copy_(param)
